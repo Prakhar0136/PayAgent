@@ -1,34 +1,31 @@
 # PayAgent
 
-PayAgent is an autonomous AI shopping agent.
+Autonomous AI shopping agent built with FastAPI,
+PostgreSQL, Redis, LangGraph, Ollama and Next.js.
 
-The user expresses a shopping goal in natural language, and the system can:
+## Features
 
-- Understand the request
-- Search products
-- Apply constraints
-- Rank products
-- Check inventory
-- Check spending policies
-- Modify the cart
-- Verify the final cart
-- Create a checkout/payment intent
-- Request human approval when required
-- Execute a mock payment through an MCP boundary
+- Natural language shopping requests
+- Product search
+- Inventory checking
+- Cart management
+- Spending policies
+- Autonomous agent workflow
+- User approval before payment
+- Mock payment processing
+- MCP payment server
+- RAG-based product search
 
 ## Architecture
 
-The project will eventually contain:
-
-- Next.js frontend
-- FastAPI backend
-- PostgreSQL database
-- Redis
-- LangGraph agent
-- Ollama local LLM
-- TypeScript MCP payment server
-- pgvector-based hybrid search
-
-## Development
-
-This project is being built incrementally in multiple phases.
+User
+ ↓
+Next.js
+ ↓
+FastAPI
+ ↓
+LangGraph Agent
+ ↓
+PostgreSQL / Redis
+ ↓
+MCP Payment Server
