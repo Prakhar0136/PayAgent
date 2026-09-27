@@ -1,85 +1,711 @@
-from fastapi import FastAPI, Depends,HTTPException
-from pydantic import BaseModel
-from app.database import get_db
-from app.models import Product as ProductModel
+from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
+
+from app.database import get_db, engine
+
+from app.models import (
+    Base,
+    Product as ProductModel,
+    Category as CategoryModel,
+    User as UserModel,
+    Inventory as InventoryModel,
+    Cart as CartModel,
+    CartItem as CartItemModel,
+    Order as OrderModel,
+    OrderItem as OrderItemModel,
+)
+
+from app.schemas import (
+    CategoryCreate,
+    CategoryResponse,
+    ProductCreate,
+    ProductResponse,
+    UserCreate,
+    UserResponse,
+    InventoryCreate,
+    InventoryResponse,
+    CartCreate,
+    CartResponse,
+    CartItemUpdate,
+    CartItemCreate,
+    CartItemResponse,
+    OrderItemResponse,
+    OrderResponse,
+)
+
 
 app = FastAPI()
 
 
-class Product(BaseModel):
-    id: int
-    name: str
-    price: int
-    category: str
+# =========================================================
+# DATABASE
+# =========================================================
 
-class Category(BaseModel):
-    id: int
-    name: str
+Base.metadata.create_all(bind=engine)
 
+
+# =========================================================
+# HEALTH
+# =========================================================
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
 
-@app.get("/products", response_model=list[Product])
-def get_products(max_price: int | None = None,db: Session = Depends(get_db)):
+# =========================================================
+# CATEGORY ENDPOINTS
+# =========================================================
 
-   products = db.query(ProductModel)
+@app.post(
+    "/categories",
+    response_model=CategoryResponse,
+    status_code=201
+)
+def create_category(
+    category: CategoryCreate,
+    db: Session = Depends(get_db)
+):
+    # Check duplicate category name
+    existing_category = db.query(CategoryModel).filter(
+        CategoryModel.name == category.name
+    ).first()
 
-   if max_price is not None:
-      products = products.filter(
-         ProductModel.price <= max_price
-      )
-
-   products = products.all()
-
-   return products
-
-
-@app.get("/products/{product_id}", response_model=Product)
-def get_product(product_id: int,db: Session = Depends(get_db)):
-    
-    products = db.query(ProductModel).filter(
-        ProductModel.id == product_id       
-    ).all()
-
-    if len(products) == 0:
+    if existing_category:
         raise HTTPException(
-            status_code=404,
-        detail="Product not found"
+            status_code=409,
+            detail="Category already exists"
+        )
+
+    new_category = CategoryModel(
+        name=category.name
     )
 
-    return products[0]
+    db.add(new_category)
+    db.commit()
+    db.refresh(new_category)
+
+    return new_category
 
 
-@app.get("/products/category/{category_name}")
-def get_products_by_category(category_name: str,db: Session = Depends(get_db)):
+@app.get(
+    "/categories",
+    response_model=list[CategoryResponse]
+)
+def get_categories(
+    db: Session = Depends(get_db)
+):
+    return db.query(CategoryModel).all()
 
-    products = db.query(ProductModel).filter(
-        ProductModel.category == category_name
-    ).all()
 
-    if products is None:
+@app.get(
+    "/categories/{category_id}",
+    response_model=CategoryResponse
+)
+def get_category(
+    category_id: int,
+    db: Session = Depends(get_db)
+):
+    category = db.query(CategoryModel).filter(
+        CategoryModel.id == category_id
+    ).first()
+
+    if category is None:
         raise HTTPException(
             status_code=404,
             detail="Category not found"
         )
 
-    return [
-        product
-        for product in products
-    ]
+    return category
 
-@app.get("/category/{category_id}", response_model=Category)
-def get_category(category_id: int):
 
-    for category in CATEGORIES:
-        if category.id == category_id:
-            return category
+# =========================================================
+# PRODUCT ENDPOINTS
+# =========================================================
 
-    raise HTTPException(
-        status_code=404,
-        detail="Category not found"
+@app.post(
+    "/products",
+    response_model=ProductResponse,
+    status_code=201
+)
+def create_product(
+    product: ProductCreate,
+    db: Session = Depends(get_db)
+):
+    # Check that category exists
+    category = db.query(CategoryModel).filter(
+        CategoryModel.id == product.category_id
+    ).first()
+
+    if category is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found"
+        )
+
+    new_product = ProductModel(
+        name=product.name,
+        price=product.price,
+        category_id=product.category_id
     )
+
+    db.add(new_product)
+    db.commit()
+    db.refresh(new_product)
+
+    return new_product
+
+
+@app.get(
+    "/products",
+    response_model=list[ProductResponse]
+)
+def get_products(
+    max_price: int | None = None,
+    db: Session = Depends(get_db)
+):
+    products = db.query(ProductModel)
+
+    if max_price is not None:
+        products = products.filter(
+            ProductModel.price <= max_price
+        )
+
+    return products.all()
+
+
+@app.get(
+    "/products/category/{category_name}",
+    response_model=list[ProductResponse]
+)
+def get_products_by_category_name(
+    category_name: str,
+    db: Session = Depends(get_db)
+):
+    # First check that category exists
+    # NOTE: This route MUST be registered before /products/{product_id}
+    # so FastAPI does not try to coerce "category" as an integer.
+    category = db.query(CategoryModel).filter(
+        CategoryModel.name == category_name
+    ).first()
+
+    if category is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found"
+        )
+
+    return db.query(ProductModel).filter(
+        ProductModel.category_id == category.id
+    ).all()
+
+
+@app.get(
+    "/products/{product_id}",
+    response_model=ProductResponse
+)
+def get_product(
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    product = db.query(ProductModel).filter(
+        ProductModel.id == product_id
+    ).first()
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    return product
+
+
+@app.get(
+    "/categories/{category_id}/products",
+    response_model=list[ProductResponse]
+)
+def get_products_by_category_id(
+    category_id: int,
+    db: Session = Depends(get_db)
+):
+    # First check that category exists
+    category = db.query(CategoryModel).filter(
+        CategoryModel.id == category_id
+    ).first()
+
+    if category is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found"
+        )
+
+    # Category exists but may have zero products.
+    # In that case return [].
+    return db.query(ProductModel).filter(
+        ProductModel.category_id == category_id
+    ).all()
+
+
+# =========================================================
+# USER ENDPOINTS
+# =========================================================
+
+@app.post(
+    "/users",
+    response_model=UserResponse,
+    status_code=201
+)
+def create_user(
+    user: UserCreate,
+    db: Session = Depends(get_db)
+):
+    # Check duplicate email
+    existing_user = db.query(UserModel).filter(
+        UserModel.email == user.email
+    ).first()
+
+    if existing_user:
+        raise HTTPException(
+            status_code=409,
+            detail="Email already registered"
+        )
+
+    new_user = UserModel(
+        name=user.name,
+        email=user.email
+    )
+
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+
+    return new_user
+
+
+# =========================================================
+# INVENTORY ENDPOINTS
+# =========================================================
+
+@app.post(
+    "/inventory",
+    response_model=InventoryResponse,
+    status_code=201
+)
+def create_inventory(
+    inv: InventoryCreate,
+    db: Session = Depends(get_db)
+):
+    # Check product exists
+    product = db.query(ProductModel).filter(
+        ProductModel.id == inv.product_id
+    ).first()
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    # Check inventory does not already exist
+    existing_inventory = db.query(InventoryModel).filter(
+        InventoryModel.product_id == inv.product_id
+    ).first()
+
+    if existing_inventory:
+        raise HTTPException(
+            status_code=409,
+            detail="Inventory already exists for this product"
+        )
+
+    new_inventory = InventoryModel(
+        product_id=inv.product_id,
+        quantity=inv.quantity
+    )
+
+    db.add(new_inventory)
+    db.commit()
+    db.refresh(new_inventory)
+
+    return new_inventory
+
+
+@app.get(
+    "/inventory/{product_id}",
+    response_model=InventoryResponse
+)
+def get_inventory(
+    product_id: int,
+    db: Session = Depends(get_db)
+):
+    inventory = db.query(InventoryModel).filter(
+        InventoryModel.product_id == product_id
+    ).first()
+
+    if inventory is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Inventory not found for this product"
+        )
+
+    return inventory
+
+# =========================================================
+# CART ENDPOINTS
+# =========================================================
+
+@app.post(
+    "/carts",
+    response_model=CartResponse,
+    status_code=201
+)
+def create_cart(
+    cart: CartCreate,
+    db: Session = Depends(get_db)
+):
+    # Check user exists
+    user = db.query(UserModel).filter(
+        UserModel.id == cart.user_id
+    ).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    new_cart = CartModel(
+        user_id=cart.user_id
+    )
+
+    db.add(new_cart)
+    db.commit()
+    db.refresh(new_cart)
+
+    return new_cart
+
+
+@app.post(
+    "/carts/{cart_id}/items",
+    response_model=CartItemResponse,
+    status_code=201
+)
+def add_item_to_cart(
+    cart_id: int,
+    item: CartItemCreate,
+    db: Session = Depends(get_db)
+):
+    # Check cart exists
+    cart = db.query(CartModel).filter(
+        CartModel.id == cart_id
+    ).first()
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    # Check product exists
+    product = db.query(ProductModel).filter(
+        ProductModel.id == item.product_id
+    ).first()
+
+    if product is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Product not found"
+        )
+
+    # Check if product is already in cart
+    existing_item = db.query(CartItemModel).filter(
+        CartItemModel.cart_id == cart_id,
+        CartItemModel.product_id == item.product_id
+    ).first()
+
+    if existing_item:
+        # Increase existing quantity instead of
+        # creating duplicate cart rows.
+        existing_item.quantity += item.quantity
+
+        db.commit()
+        db.refresh(existing_item)
+
+        return existing_item
+
+    # Otherwise create a new cart item
+    new_item = CartItemModel(
+        cart_id=cart_id,
+        product_id=item.product_id,
+        quantity=item.quantity
+    )
+
+    db.add(new_item)
+    db.commit()
+    db.refresh(new_item)
+
+    return new_item
+
+
+@app.patch(
+    "/carts/{cart_id}/items/{item_id}",
+    response_model=CartItemResponse
+)
+def update_cart_item(
+    cart_id: int,
+    item_id: int,
+    item: CartItemUpdate,
+    db: Session = Depends(get_db)
+):
+    cart_item = db.query(CartItemModel).filter(
+        CartItemModel.id == item_id,
+        CartItemModel.cart_id == cart_id
+    ).first()
+
+    if cart_item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart item not found"
+        )
+
+    cart_item.quantity = item.quantity
+
+    db.commit()
+    db.refresh(cart_item)
+
+    return cart_item
+
+
+@app.delete(
+    "/carts/{cart_id}/items/{item_id}"
+)
+def remove_cart_item(
+    cart_id: int,
+    item_id: int,
+    db: Session = Depends(get_db)
+):
+    cart_item = db.query(CartItemModel).filter(
+        CartItemModel.id == item_id,
+        CartItemModel.cart_id == cart_id
+    ).first()
+
+    if cart_item is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart item not found"
+        )
+
+    db.delete(cart_item)
+    db.commit()
+
+    return {
+        "message": "Cart item removed successfully"
+    }
+
+
+@app.get(
+    "/carts/{cart_id}",
+    response_model=CartResponse
+)
+def get_cart(
+    cart_id: int,
+    db: Session = Depends(get_db)
+):
+    cart = db.query(CartModel).filter(
+        CartModel.id == cart_id
+    ).first()
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    total = 0
+
+    for item in cart.items:
+        total += item.product.price * item.quantity
+
+    return {
+        "id": cart.id,
+        "user_id": cart.user_id,
+        "items": cart.items,
+        "total": total
+    }
+
+
+# =========================================================
+# CHECKOUT
+# =========================================================
+
+@app.post(
+    "/carts/{cart_id}/checkout",
+    response_model=OrderResponse,
+    status_code=201
+)
+def checkout_cart(
+    cart_id: int,
+    db: Session = Depends(get_db)
+):
+    # -----------------------------------------------------
+    # 1. Find cart
+    # -----------------------------------------------------
+
+    cart = db.query(CartModel).filter(
+        CartModel.id == cart_id
+    ).first()
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    # -----------------------------------------------------
+    # 2. Make sure cart isn't empty
+    # -----------------------------------------------------
+
+    if not cart.items:
+        raise HTTPException(
+            status_code=400,
+            detail="Cart is empty"
+        )
+
+    # -----------------------------------------------------
+    # 3. Validate all cart items BEFORE changing anything
+    # -----------------------------------------------------
+
+    for cart_item in cart.items:
+
+        product = db.query(ProductModel).filter(
+            ProductModel.id == cart_item.product_id
+        ).first()
+
+        if product is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Product {cart_item.product_id} not found"
+            )
+
+        inventory = db.query(InventoryModel).filter(
+            InventoryModel.product_id == product.id
+        ).first()
+
+        if inventory is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No inventory found for product {product.id}"
+            )
+
+        if inventory.quantity < cart_item.quantity:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Insufficient inventory for product "
+                    f"{product.id}. "
+                    f"Available: {inventory.quantity}, "
+                    f"Requested: {cart_item.quantity}"
+                )
+            )
+
+    # -----------------------------------------------------
+    # 4. Create order
+    # -----------------------------------------------------
+
+    new_order = OrderModel(
+        user_id=cart.user_id,
+        status="completed"
+    )
+
+    db.add(new_order)
+
+    # Generate order ID
+    db.flush()
+
+    # -----------------------------------------------------
+    # 5. Convert cart items into order items
+    # -----------------------------------------------------
+
+    for cart_item in cart.items:
+
+        product = db.query(ProductModel).filter(
+            ProductModel.id == cart_item.product_id
+        ).first()
+
+        inventory = db.query(InventoryModel).filter(
+            InventoryModel.product_id == product.id
+        ).first()
+
+        # Create order item
+        order_item = OrderItemModel(
+            order_id=new_order.id,
+            product_id=product.id,
+            quantity=cart_item.quantity,
+            unit_price=product.price
+        )
+
+        db.add(order_item)
+
+        # Reduce inventory
+        inventory.quantity -= cart_item.quantity
+
+        # Remove item from cart
+        db.delete(cart_item)
+
+    # -----------------------------------------------------
+    # 6. Commit everything
+    # -----------------------------------------------------
+
+    db.commit()
+
+    # -----------------------------------------------------
+    # 7. Refresh order
+    # -----------------------------------------------------
+
+    db.refresh(new_order)
+
+    return new_order
+
+
+@app.get(
+    "/orders/{order_id}",
+    response_model=OrderResponse
+)
+def get_order(
+    order_id: int,
+    db: Session = Depends(get_db)
+):
+    order = db.query(OrderModel).filter(
+        OrderModel.id == order_id
+    ).first()
+
+    if order is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Order not found"
+        )
+
+    return order
+
+
+@app.get(
+    "/users/{user_id}/orders",
+    response_model=list[OrderResponse]
+)
+def get_user_orders(
+    user_id: int,
+    db: Session = Depends(get_db)
+):
+    user = db.query(UserModel).filter(
+        UserModel.id == user_id
+    ).first()
+
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+
+    return db.query(OrderModel).filter(
+        OrderModel.user_id == user_id
+    ).all()
