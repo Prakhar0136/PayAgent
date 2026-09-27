@@ -1,6 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends,HTTPException
 from pydantic import BaseModel
-
+from app.database import get_db
+from app.models import Product as ProductModel
+from sqlalchemy.orm import Session
 
 app = FastAPI()
 
@@ -15,43 +17,6 @@ class Category(BaseModel):
     id: int
     name: str
 
-PRODUCTS = [
-    Product(
-        id=1,
-        name="Running Shoes",
-        price=2799,
-        category="shoes"
-    ),
-    Product(
-        id=2,
-        name="Walking Shoes",
-        price=1999,
-        category="shoes"
-    ),
-    Product(
-        id=3,
-        name="Training Shoes",
-        price=2499,
-        category="shoes"
-    ),
-    Product(
-        id=4,
-        name="T-Shirt",
-        price=999,
-        category="clothing"
-    ),
-]
-
-CATEGORIES = [
-    Category(
-        id=1,
-        name="Shoes"
-    ),
-    Category(
-        id=2,
-        name="Clothing"
-    ),
-]
 
 @app.get("/health")
 def health_check():
@@ -59,40 +24,52 @@ def health_check():
 
 
 @app.get("/products", response_model=list[Product])
-def get_products(max_price: int | None = None):
+def get_products(max_price: int | None = None,db: Session = Depends(get_db)):
 
-    products = PRODUCTS 
+   products = db.query(ProductModel)
 
-    if max_price is not None:
-        products = [
-            product
-            for product in products
-            if product.price <= max_price
-        ]
+   if max_price is not None:
+      products = products.filter(
+         ProductModel.price <= max_price
+      )
 
-    return products
+   products = products.all()
+
+   return products
 
 
 @app.get("/products/{product_id}", response_model=Product)
-def get_product(product_id: int):
+def get_product(product_id: int,db: Session = Depends(get_db)):
     
-    for product in PRODUCTS:
-        if product.id == product_id:
-            return product
+    products = db.query(ProductModel).filter(
+        ProductModel.id == product_id       
+    ).all()
 
-    raise HTTPException(
-        status_code=404,
+    if len(products) == 0:
+        raise HTTPException(
+            status_code=404,
         detail="Product not found"
     )
 
+    return products[0]
+
 
 @app.get("/products/category/{category_name}")
-def get_products_by_category(category_name: str):
+def get_products_by_category(category_name: str,db: Session = Depends(get_db)):
+
+    products = db.query(ProductModel).filter(
+        ProductModel.category == category_name
+    ).all()
+
+    if products is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Category not found"
+        )
 
     return [
         product
-        for product in PRODUCTS
-        if product.category.lower() == category_name.lower()
+        for product in products
     ]
 
 @app.get("/category/{category_id}", response_model=Category)
