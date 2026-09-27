@@ -22,3 +22,4 @@ class Product(Base):
     category: Mapped[str] = mapped_column(
         String(100)
     )
+

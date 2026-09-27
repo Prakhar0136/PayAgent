@@ -41,17 +41,17 @@ def get_products(max_price: int | None = None,db: Session = Depends(get_db)):
 @app.get("/products/{product_id}", response_model=Product)
 def get_product(product_id: int,db: Session = Depends(get_db)):
     
-    products = db.query(ProductModel).filter(
-        ProductModel.id == product_id       
-    ).all()
+    product = db.query(ProductModel).filter(
+    ProductModel.id == product_id
+).first()
 
-    if len(products) == 0:
-        raise HTTPException(
-            status_code=404,
+if product is None:
+    raise HTTPException(
+        status_code=404,
         detail="Product not found"
     )
 
-    return products[0]
+return product
 
 
 @app.get("/products/category/{category_name}")
@@ -71,15 +71,3 @@ def get_products_by_category(category_name: str,db: Session = Depends(get_db)):
         product
         for product in products
     ]
-
-@app.get("/category/{category_id}", response_model=Category)
-def get_category(category_id: int):
-
-    for category in CATEGORIES:
-        if category.id == category_id:
-            return category
-
-    raise HTTPException(
-        status_code=404,
-        detail="Category not found"
-    )
