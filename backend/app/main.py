@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.database import get_db, engine
 
@@ -36,26 +37,13 @@ from app.schemas import (
 
 app = FastAPI()
 
-
-# =========================================================
-# DATABASE
-# =========================================================
-
 Base.metadata.create_all(bind=engine)
-
-
-# =========================================================
-# HEALTH
-# =========================================================
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-
-# =========================================================
 # CATEGORY ENDPOINTS
-# =========================================================
 
 @app.post(
     "/categories",
@@ -118,10 +106,7 @@ def get_category(
 
     return category
 
-
-# =========================================================
 # PRODUCT ENDPOINTS
-# =========================================================
 
 @app.post(
     "/products",
@@ -246,10 +231,7 @@ def get_products_by_category_id(
         ProductModel.category_id == category_id
     ).all()
 
-
-# =========================================================
 # USER ENDPOINTS
-# =========================================================
 
 @app.post(
     "/users",
@@ -282,10 +264,7 @@ def create_user(
 
     return new_user
 
-
-# =========================================================
 # INVENTORY ENDPOINTS
-# =========================================================
 
 @app.post(
     "/inventory",
@@ -350,9 +329,7 @@ def get_inventory(
 
     return inventory
 
-# =========================================================
 # CART ENDPOINTS
-# =========================================================
 
 @app.post(
     "/carts",
@@ -434,17 +411,35 @@ def add_item_to_cart(
         return existing_item
 
     # Otherwise create a new cart item
-    new_item = CartItemModel(
-        cart_id=cart_id,
-        product_id=item.product_id,
-        quantity=item.quantity
-    )
+    try:
+        new_item = CartItemModel(
+            cart_id=cart_id,
+            product_id=item.product_id,
+            quantity=item.quantity
+        )
 
-    db.add(new_item)
-    db.commit()
-    db.refresh(new_item)
+        db.add(new_item)
+        db.commit()
+        db.refresh(new_item)
 
-    return new_item
+        return new_item
+    except IntegrityError:
+        db.rollback()
+        existing_item = db.query(CartItemModel).filter(
+            CartItemModel.cart_id == cart_id,
+            CartItemModel.product_id == item.product_id
+        ).first()
+
+        if existing_item:
+            existing_item.quantity += item.quantity
+            db.commit()
+            db.refresh(existing_item)
+            return existing_item
+
+        raise HTTPException(
+            status_code=400,
+            detail="Error adding item to cart"
+        )
 
 
 @app.patch(
@@ -533,10 +528,7 @@ def get_cart(
         "total": total
     }
 
-
-# =========================================================
 # CHECKOUT
-# =========================================================
 
 @app.post(
     "/carts/{cart_id}/checkout",
@@ -545,126 +537,147 @@ def get_cart(
 )
 def checkout_cart(
     cart_id: int,
+    idempotency_key: str | None = Header(None, alias="Idempotency-Key"),
     db: Session = Depends(get_db)
 ):
-    # -----------------------------------------------------
-    # 1. Find cart
-    # -----------------------------------------------------
-
-    cart = db.query(CartModel).filter(
-        CartModel.id == cart_id
-    ).first()
-
-    if cart is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Cart not found"
-        )
-
-    # -----------------------------------------------------
-    # 2. Make sure cart isn't empty
-    # -----------------------------------------------------
-
-    if not cart.items:
-        raise HTTPException(
-            status_code=400,
-            detail="Cart is empty"
-        )
-
-    # -----------------------------------------------------
-    # 3. Validate all cart items BEFORE changing anything
-    # -----------------------------------------------------
-
-    for cart_item in cart.items:
-
-        product = db.query(ProductModel).filter(
-            ProductModel.id == cart_item.product_id
+    # Check for existing order with idempotency key prior to starting transaction
+    if idempotency_key:
+        existing_order = db.query(OrderModel).filter(
+            OrderModel.idempotency_key == idempotency_key
         ).first()
 
-        if product is None:
+        if existing_order:
+            return existing_order
+
+    try:
+        # -----------------------------------------------------
+        # 1. Find cart with row-level lock
+        # -----------------------------------------------------
+        cart = db.query(CartModel).filter(
+            CartModel.id == cart_id
+        ).with_for_update().first()
+
+        if cart is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"Product {cart_item.product_id} not found"
+                detail="Cart not found"
             )
 
-        inventory = db.query(InventoryModel).filter(
-            InventoryModel.product_id == product.id
-        ).first()
-
-        if inventory is None:
+        # -----------------------------------------------------
+        # 2. Make sure cart isn't empty
+        # -----------------------------------------------------
+        if not cart.items:
             raise HTTPException(
                 status_code=400,
-                detail=f"No inventory found for product {product.id}"
+                detail="Cart is empty"
             )
 
-        if inventory.quantity < cart_item.quantity:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Insufficient inventory for product "
-                    f"{product.id}. "
-                    f"Available: {inventory.quantity}, "
-                    f"Requested: {cart_item.quantity}"
+        # Sort items by product_id to ensure consistent locking order across transactions and avoid deadlocks
+        sorted_cart_items = sorted(cart.items, key=lambda item: item.product_id)
+
+        # -----------------------------------------------------
+        # 3. Validate and lock inventory for each product
+        # -----------------------------------------------------
+        validated_items = []
+        for cart_item in sorted_cart_items:
+            product = db.query(ProductModel).filter(
+                ProductModel.id == cart_item.product_id
+            ).first()
+
+            if product is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Product {cart_item.product_id} not found"
                 )
-            )
 
-    # -----------------------------------------------------
-    # 4. Create order
-    # -----------------------------------------------------
+            # Row-level lock on inventory record to handle concurrent checkout requests safely
+            inventory = db.query(InventoryModel).filter(
+                InventoryModel.product_id == product.id
+            ).with_for_update().first()
 
-    new_order = OrderModel(
-        user_id=cart.user_id,
-        status="completed"
-    )
+            if inventory is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"No inventory found for product {product.id}"
+                )
 
-    db.add(new_order)
+            if inventory.quantity < cart_item.quantity:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Insufficient inventory for product "
+                        f"{product.id}. "
+                        f"Available: {inventory.quantity}, "
+                        f"Requested: {cart_item.quantity}"
+                    )
+                )
 
-    # Generate order ID
-    db.flush()
+            validated_items.append((cart_item, product, inventory))
 
-    # -----------------------------------------------------
-    # 5. Convert cart items into order items
-    # -----------------------------------------------------
-
-    for cart_item in cart.items:
-
-        product = db.query(ProductModel).filter(
-            ProductModel.id == cart_item.product_id
-        ).first()
-
-        inventory = db.query(InventoryModel).filter(
-            InventoryModel.product_id == product.id
-        ).first()
-
-        # Create order item
-        order_item = OrderItemModel(
-            order_id=new_order.id,
-            product_id=product.id,
-            quantity=cart_item.quantity,
-            unit_price=product.price
+        # -----------------------------------------------------
+        # 4. Create order
+        # -----------------------------------------------------
+        new_order = OrderModel(
+            user_id=cart.user_id,
+            status="completed",
+            idempotency_key=idempotency_key
         )
 
-        db.add(order_item)
+        db.add(new_order)
+        db.flush()
 
-        # Reduce inventory
-        inventory.quantity -= cart_item.quantity
+        # -----------------------------------------------------
+        # 5. Convert cart items into order items & update inventory
+        # -----------------------------------------------------
+        for cart_item, product, inventory in validated_items:
+            # Create order item
+            order_item = OrderItemModel(
+                order_id=new_order.id,
+                product_id=product.id,
+                quantity=cart_item.quantity,
+                unit_price=product.price
+            )
 
-        # Remove item from cart
-        db.delete(cart_item)
+            db.add(order_item)
 
-    # -----------------------------------------------------
-    # 6. Commit everything
-    # -----------------------------------------------------
+            # Deduct locked inventory
+            inventory.quantity -= cart_item.quantity
 
-    db.commit()
+            # Remove item from cart
+            db.delete(cart_item)
 
-    # -----------------------------------------------------
-    # 7. Refresh order
-    # -----------------------------------------------------
+        # -----------------------------------------------------
+        # 6. Commit transaction atomically
+        # -----------------------------------------------------
+        db.commit()
 
-    db.refresh(new_order)
+        # -----------------------------------------------------
+        # 7. Refresh order and return
+        # -----------------------------------------------------
+        db.refresh(new_order)
+        return new_order
 
-    return new_order
+    except HTTPException:
+        db.rollback()
+        raise
+    except IntegrityError:
+        db.rollback()
+        if idempotency_key:
+            existing_order = db.query(OrderModel).filter(
+                OrderModel.idempotency_key == idempotency_key
+            ).first()
+            if existing_order:
+                return existing_order
+        raise HTTPException(
+            status_code=400,
+            detail="Conflict or duplicate request encountered during checkout."
+        )
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during checkout: {str(e)}"
+        )
 
 
 @app.get(
