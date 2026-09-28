@@ -1,16 +1,12 @@
 from pydantic import BaseModel, Field
 
-
-# =========================================================
 # CATEGORY SCHEMAS
-# =========================================================
 
 class CategoryCreate(BaseModel):
     name: str = Field(
         min_length=1,
         max_length=100
     )
-
 
 class CategoryResponse(BaseModel):
     id: int
@@ -20,10 +16,7 @@ class CategoryResponse(BaseModel):
         "from_attributes": True
     }
 
-
-# =========================================================
 # PRODUCT SCHEMAS
-# =========================================================
 
 class ProductCreate(BaseModel):
     name: str = Field(
@@ -39,7 +32,6 @@ class ProductCreate(BaseModel):
         gt=0
     )
 
-
 class ProductResponse(BaseModel):
     id: int
     name: str
@@ -50,10 +42,7 @@ class ProductResponse(BaseModel):
         "from_attributes": True
     }
 
-
-# =========================================================
 # INVENTORY SCHEMAS
-# =========================================================
 
 class InventoryCreate(BaseModel):
     product_id: int = Field(
@@ -64,7 +53,6 @@ class InventoryCreate(BaseModel):
         ge=0
     )
 
-
 class InventoryResponse(BaseModel):
     id: int
     product_id: int
@@ -74,10 +62,7 @@ class InventoryResponse(BaseModel):
         "from_attributes": True
     }
 
-
-# =========================================================
 # USER SCHEMAS
-# =========================================================
 
 class UserCreate(BaseModel):
     name: str = Field(
@@ -90,7 +75,6 @@ class UserCreate(BaseModel):
         max_length=255
     )
 
-
 class UserResponse(BaseModel):
     id: int
     name: str
@@ -100,16 +84,12 @@ class UserResponse(BaseModel):
         "from_attributes": True
     }
 
-
-# =========================================================
 # CART SCHEMAS
-# =========================================================
 
 class CartCreate(BaseModel):
     user_id: int = Field(
         gt=0
     )
-
 
 class CartItemCreate(BaseModel):
     product_id: int = Field(
@@ -120,10 +100,8 @@ class CartItemCreate(BaseModel):
         gt=0
     )
 
-
 class CartItemUpdate(BaseModel):
     quantity: int = Field(gt=0)
-
 
 class CartItemResponse(BaseModel):
     id: int
@@ -133,7 +111,6 @@ class CartItemResponse(BaseModel):
     model_config = {
         "from_attributes": True
     }
-
 
 class CartResponse(BaseModel):
     id: int
@@ -147,10 +124,7 @@ class CartResponse(BaseModel):
         "from_attributes": True
     }
 
-
-# =========================================================
 # ORDER SCHEMAS
-# =========================================================
 
 class OrderItemResponse(BaseModel):
     id: int
@@ -162,11 +136,11 @@ class OrderItemResponse(BaseModel):
         "from_attributes": True
     }
 
-
 class OrderResponse(BaseModel):
     id: int
     user_id: int
     status: str
+    idempotency_key: str | None = None
 
     items: list[OrderItemResponse] = Field(
         default_factory=list

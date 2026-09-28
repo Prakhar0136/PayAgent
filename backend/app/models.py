@@ -1,4 +1,4 @@
-from sqlalchemy import ForeignKey, String
+from sqlalchemy import ForeignKey, String, UniqueConstraint
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -147,6 +147,9 @@ class Cart(Base):
 
 class CartItem(Base):
     __tablename__ = "cart_items"
+    __table_args__ = (
+        UniqueConstraint("cart_id", "product_id", name="uq_cart_item_product"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
 
@@ -189,6 +192,13 @@ class Order(Base):
         String(50),
         nullable=False,
         default="pending"
+    )
+
+    idempotency_key: Mapped[str | None] = mapped_column(
+        String(255),
+        unique=True,
+        nullable=True,
+        index=True
     )
 
     user: Mapped["User"] = relationship(
