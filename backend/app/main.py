@@ -1,3 +1,5 @@
+import json
+
 from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -34,16 +36,73 @@ from app.schemas import (
     OrderResponse,
 )
 
+from app.redis import get_redis, PRODUCT_TTL, ping_redis
+from app.events import publish_event, get_agent_events, clear_agent_events
+
 
 app = FastAPI()
 
 Base.metadata.create_all(bind=engine)
 
+# ---------------------------------------------------------------------------
+# Cache key helpers
+# ---------------------------------------------------------------------------
+
+def _product_key(product_id: int) -> str:
+    return f"product:{product_id}"
+
+
+def _product_list_key(max_price: int | None = None) -> str:
+    return f"products:list:{max_price if max_price is not None else 'all'}"
+
+
+def _category_products_key(category_id: int) -> str:
+    return f"products:category:{category_id}"
+
+
+# ---------------------------------------------------------------------------
+# Cache invalidation
+# ---------------------------------------------------------------------------
+
+def _invalidate_product_caches(product_id: int | None = None) -> None:
+    """
+    Delete cached product entries that may be stale after a write.
+
+    • Always wipes the list caches (they contain all products so any
+      mutation makes them stale).
+    • If product_id is given, also wipes the per-product cache.
+    """
+    redis_client = get_redis()
+
+    # Wipe all list-style product caches via a key-pattern scan.
+    # SCAN is safe for production; KEYS is avoided intentionally.
+    cursor = 0
+    while True:
+        cursor, keys = redis_client.scan(cursor, match="products:*", count=100)
+        if keys:
+            redis_client.delete(*keys)
+        if cursor == 0:
+            break
+
+    if product_id is not None:
+        redis_client.delete(_product_key(product_id))
+
+
+# ---------------------------------------------------------------------------
+# HEALTH
+# ---------------------------------------------------------------------------
+
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "redis": "ok" if ping_redis() else "unavailable",
+    }
 
+
+# ---------------------------------------------------------------------------
 # CATEGORY ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/categories",
@@ -106,7 +165,10 @@ def get_category(
 
     return category
 
+
+# ---------------------------------------------------------------------------
 # PRODUCT ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/products",
@@ -138,6 +200,21 @@ def create_product(
     db.commit()
     db.refresh(new_product)
 
+    # Warm the per-product cache immediately and invalidate list caches
+    # so the next list request re-fetches from Postgres.
+    redis_client = get_redis()
+    redis_client.setex(
+        _product_key(new_product.id),
+        PRODUCT_TTL,
+        json.dumps({
+            "id": new_product.id,
+            "name": new_product.name,
+            "price": new_product.price,
+            "category_id": new_product.category_id,
+        })
+    )
+    _invalidate_product_caches()  # wipe stale list caches
+
     return new_product
 
 
@@ -149,14 +226,35 @@ def get_products(
     max_price: int | None = None,
     db: Session = Depends(get_db)
 ):
-    products = db.query(ProductModel)
+    redis_client = get_redis()
+    cache_key = _product_list_key(max_price)
+
+    # --- Cache read ---
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # --- Cache miss: query Postgres ---
+    query = db.query(ProductModel)
 
     if max_price is not None:
-        products = products.filter(
-            ProductModel.price <= max_price
-        )
+        query = query.filter(ProductModel.price <= max_price)
 
-    return products.all()
+    products = query.all()
+
+    # Serialise and cache the list result
+    serialised = [
+        {
+            "id": p.id,
+            "name": p.name,
+            "price": p.price,
+            "category_id": p.category_id,
+        }
+        for p in products
+    ]
+    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+
+    return products
 
 
 @app.get(
@@ -167,9 +265,10 @@ def get_products_by_category_name(
     category_name: str,
     db: Session = Depends(get_db)
 ):
-    # First check that category exists
     # NOTE: This route MUST be registered before /products/{product_id}
     # so FastAPI does not try to coerce "category" as an integer.
+
+    # First check that category exists
     category = db.query(CategoryModel).filter(
         CategoryModel.name == category_name
     ).first()
@@ -180,9 +279,31 @@ def get_products_by_category_name(
             detail="Category not found"
         )
 
-    return db.query(ProductModel).filter(
+    redis_client = get_redis()
+    cache_key = _category_products_key(category.id)
+
+    # --- Cache read ---
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # --- Cache miss: query Postgres ---
+    products = db.query(ProductModel).filter(
         ProductModel.category_id == category.id
     ).all()
+
+    serialised = [
+        {
+            "id": p.id,
+            "name": p.name,
+            "price": p.price,
+            "category_id": p.category_id,
+        }
+        for p in products
+    ]
+    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+
+    return products
 
 
 @app.get(
@@ -193,6 +314,15 @@ def get_product(
     product_id: int,
     db: Session = Depends(get_db)
 ):
+    redis_client = get_redis()
+    cache_key = _product_key(product_id)
+
+    # --- Cache read ---
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # --- Cache miss: query Postgres ---
     product = db.query(ProductModel).filter(
         ProductModel.id == product_id
     ).first()
@@ -202,6 +332,17 @@ def get_product(
             status_code=404,
             detail="Product not found"
         )
+
+    redis_client.setex(
+        cache_key,
+        PRODUCT_TTL,
+        json.dumps({
+            "id": product.id,
+            "name": product.name,
+            "price": product.price,
+            "category_id": product.category_id,
+        })
+    )
 
     return product
 
@@ -225,13 +366,37 @@ def get_products_by_category_id(
             detail="Category not found"
         )
 
-    # Category exists but may have zero products.
-    # In that case return [].
-    return db.query(ProductModel).filter(
+    redis_client = get_redis()
+    cache_key = _category_products_key(category_id)
+
+    # --- Cache read ---
+    cached = redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # --- Cache miss: query Postgres ---
+    # Category exists but may have zero products; return [] in that case.
+    products = db.query(ProductModel).filter(
         ProductModel.category_id == category_id
     ).all()
 
+    serialised = [
+        {
+            "id": p.id,
+            "name": p.name,
+            "price": p.price,
+            "category_id": p.category_id,
+        }
+        for p in products
+    ]
+    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+
+    return products
+
+
+# ---------------------------------------------------------------------------
 # USER ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/users",
@@ -264,7 +429,10 @@ def create_user(
 
     return new_user
 
+
+# ---------------------------------------------------------------------------
 # INVENTORY ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/inventory",
@@ -329,7 +497,10 @@ def get_inventory(
 
     return inventory
 
+
+# ---------------------------------------------------------------------------
 # CART ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/carts",
@@ -528,7 +699,10 @@ def get_cart(
         "total": total
     }
 
+
+# ---------------------------------------------------------------------------
 # CHECKOUT
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/carts/{cart_id}/checkout",
@@ -646,6 +820,9 @@ def checkout_cart(
             # Remove item from cart
             db.delete(cart_item)
 
+            # Invalidate per-product cache since inventory changed
+            _invalidate_product_caches(product.id)
+
         # -----------------------------------------------------
         # 6. Commit transaction atomically
         # -----------------------------------------------------
@@ -679,6 +856,10 @@ def checkout_cart(
             detail=f"An error occurred during checkout: {str(e)}"
         )
 
+
+# ---------------------------------------------------------------------------
+# ORDER ENDPOINTS
+# ---------------------------------------------------------------------------
 
 @app.get(
     "/orders/{order_id}",
@@ -722,3 +903,72 @@ def get_user_orders(
     return db.query(OrderModel).filter(
         OrderModel.user_id == user_id
     ).all()
+
+
+# ---------------------------------------------------------------------------
+# AGENT EVENT ENDPOINTS
+# ---------------------------------------------------------------------------
+
+@app.post(
+    "/agents/{run_id}/events",
+    status_code=201
+)
+def post_agent_event(
+    run_id: str,
+    body: dict
+):
+    """
+    Publish an agent event for a given run_id.
+
+    Body JSON shape::
+
+        {
+          "type": "search",
+          "data": { "message": "Searching products..." }
+        }
+
+    The event is:
+      • Published to Redis Pub/Sub channel  ``agent:<run_id>``
+      • Appended to Redis list ``agent:events:<run_id>``  (TTL = 5 min)
+    """
+    event_type = body.get("type", "generic")
+    data = body.get("data", {})
+
+    publish_event(run_id=run_id, event_type=event_type, data=data)
+
+    return {
+        "status": "published",
+        "run_id": run_id,
+        "type": event_type,
+    }
+
+
+@app.get(
+    "/agents/{run_id}/events"
+)
+def list_agent_events(run_id: str):
+    """
+    Return all stored events for a given agent run in chronological order.
+
+    Events are retrieved from the Redis list ``agent:events:<run_id>``.
+    Returns an empty list if the run_id is unknown or has expired.
+    """
+    events = get_agent_events(run_id)
+    return {
+        "run_id": run_id,
+        "count": len(events),
+        "events": events,
+    }
+
+
+@app.delete(
+    "/agents/{run_id}/events"
+)
+def delete_agent_events(run_id: str):
+    """Clear all stored events for a given agent run."""
+    deleted = clear_agent_events(run_id)
+    return {
+        "status": "cleared" if deleted else "not_found",
+        "run_id": run_id,
+    }
+    
