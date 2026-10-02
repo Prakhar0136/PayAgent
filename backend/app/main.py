@@ -1,5 +1,8 @@
 import json
 
+from dotenv import load_dotenv
+load_dotenv()  # Load .env into os.environ before anything else runs
+
 from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -39,8 +42,11 @@ from app.schemas import (
 from app.redis import get_redis, PRODUCT_TTL, ping_redis
 from app.events import publish_event, get_agent_events, clear_agent_events
 
+from app.agent_router import router as agent_router
 
 app = FastAPI()
+app.include_router(agent_router)
+
 
 Base.metadata.create_all(bind=engine)
 
