@@ -115,6 +115,7 @@ class CartItemResponse(BaseModel):
 class CartResponse(BaseModel):
     id: int
     user_id: int
+    total: int = 0
 
     items: list[CartItemResponse] = Field(
         default_factory=list

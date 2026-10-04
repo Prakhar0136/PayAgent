@@ -12,6 +12,9 @@ Why call our own FastAPI instead of touching DB directly?
 
 import os
 import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Base URL of your running FastAPI server
 # Change this if your server runs on a different port
@@ -75,4 +78,31 @@ def get_cart(cart_id: int) -> dict:
     url = f"{BASE_URL}/carts/{cart_id}"
     resp = httpx.get(url, timeout=10)
     resp.raise_for_status()
+    return resp.json()
+
+
+def checkout_cart(cart_id: int, idempotency_key: str | None = None) -> dict:
+    """
+    Calls POST /carts/{cart_id}/checkout
+    Optionally passes an Idempotency-Key header to prevent double charges.
+    Returns the OrderResponse dict.
+    """
+    url = f"{BASE_URL}/carts/{cart_id}/checkout"
+    headers = {}
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+
+    resp = httpx.post(url, headers=headers, timeout=15)
+
+    # Surface the actual error detail from the response body instead of the
+    # generic httpx status message (e.g. "500 Internal Server Error").
+    if resp.is_error:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(
+            f"Checkout endpoint returned {resp.status_code}: {detail}"
+        )
+
     return resp.json()

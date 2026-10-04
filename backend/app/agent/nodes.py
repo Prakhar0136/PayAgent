@@ -21,6 +21,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from app.agent.state import AgentState
 from app.agent import tools as agent_tools
 from app.events import publish_event
+from langgraph.types import interrupt
+
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +105,7 @@ Rules:
         data={"budget": budget, "category": category}
     )
 
-    return {"budget": budget}   # we'll use category implicitly in next node
+    return {"budget": budget, "category": category}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -122,7 +124,20 @@ def node_search_products(state: AgentState) -> dict:
         data={"message": f"Searching products under ₹{state['budget']}..."}
     )
 
-    products = agent_tools.search_products(max_price=state["budget"])
+    category = state.get("category")
+    products = []
+    if category:
+        try:
+            products = agent_tools.search_products(
+                max_price=state["budget"],
+                category_name=category
+            )
+        except Exception as e:
+            logger.warning(f"[search_products] Search with category '{category}' failed: {e}")
+
+    # Fallback to general search if category search produced no results
+    if not products:
+        products = agent_tools.search_products(max_price=state["budget"])
 
     logger.info(f"[search_products] Found {len(products)} products")
 
@@ -210,12 +225,23 @@ def node_check_budget(state: AgentState) -> dict:
             "final_message": "No products found within your budget.",
         }
 
-    # Products have already passed:
-    # 1. price <= budget
-    # 2. stock > 0
-    #
-    # For now, choose the first valid product.
-    chosen_products = products[:1]
+    # Select the best matching in-stock product that fits the query
+    if len(products) == 1:
+        chosen_products = products
+    else:
+        query_words = set(re.findall(r"\w+", state["query"].lower()))
+        stop_words = {"find", "get", "buy", "under", "me", "the", "a", "an", "for", "in", "with", "show"}
+        keywords = {w for w in query_words if w not in stop_words and len(w) > 2}
+
+        ranked = sorted(
+            products,
+            key=lambda p: (
+                sum(1 for kw in keywords if kw in p["name"].lower()),
+                -p["price"],
+            ),
+            reverse=True,
+        )
+        chosen_products = [ranked[0]]
 
     logger.info(
         f"[check_budget] Selected {len(chosen_products)} products"
@@ -334,3 +360,165 @@ Total cart value: ₹{cart.get('total', 0)}
         "cart_summary": cart,
         "final_message": final_message,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE 6: node_request_payment_approval
+# PAUSES the graph here and waits for human input via interrupt()
+# ─────────────────────────────────────────────────────────────────────────────
+
+def node_request_payment_approval(state: AgentState) -> dict:
+    """
+    This is the Human-in-the-Loop checkpoint.
+
+    interrupt(payload) does three things:
+      1. Serialises the entire AgentState into the checkpointer
+      2. Raises an internal exception that LangGraph catches
+      3. Returns the payload to the caller of .invoke()
+
+    The graph is now FROZEN. Nothing else runs until the user resumes it.
+
+    The caller (agent_router.py) will:
+      - Detect that the graph was interrupted (GraphInterrupt exception)
+      - Return HTTP 202 to the frontend with the cart summary
+      - Wait for the user to hit POST /agent/approve/{thread_id}
+    """
+    cart_summary = state.get("cart_summary", {})
+    items_added = state.get("cart_items_added", [])
+
+    # If nothing was added and cart total is 0 or cart has no items, do not interrupt for approval
+    if not items_added and not cart_summary.get("items"):
+        return {
+            "user_approved": False,
+            "approval_status": "no_action_needed",
+            "final_message": state.get("final_message") or "No products found within your budget.",
+        }
+
+    publish_event(
+        run_id=state["run_id"],
+        event_type="awaiting_approval",
+        data={
+            "message": "Waiting for your payment approval...",
+            "cart_total": cart_summary.get("total", 0),
+            "items_count": len(items_added),
+            "items": items_added,
+        }
+    )
+
+    # Build the approval payload — this is what the frontend will show the user
+    approval_payload = {
+        "message": "Please review your cart and approve payment.",
+        "cart_summary": cart_summary,
+        "items_added": items_added,
+        "cart_total": cart_summary.get("total", 0),
+        "budget": state.get("budget", 0),
+    }
+
+    # ── THIS IS THE KEY LINE ──────────────────────────────────────────────────
+    # interrupt() pauses the graph and sends approval_payload back to the caller.
+    # The VALUE returned by interrupt() is whatever the human sends back on resume.
+    # We store it in user_decision, then use it in the next node.
+    user_decision = interrupt(approval_payload)
+    # ── GRAPH RESUMES HERE WHEN USER CALLS /agent/approve or /agent/reject ──
+
+    if isinstance(user_decision, dict):
+        approved = bool(user_decision.get("approved", False))
+    else:
+        approved = bool(user_decision)
+    approval_status = "approved" if approved else "rejected"
+
+    publish_event(
+        run_id=state["run_id"],
+        event_type="approval_received",
+        data={
+            "message": f"Payment {'approved ✓' if approved else 'rejected ✗'} by user",
+            "approved": approved,
+        }
+    )
+
+    return {
+        "user_approved": approved,
+        "approval_status": approval_status,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NODE 7: node_process_checkout
+# Calls POST /carts/{cart_id}/checkout if user approved, otherwise cancels
+# ─────────────────────────────────────────────────────────────────────────────
+
+def node_process_checkout(state: AgentState) -> dict:
+    """
+    Conditional checkout node — runs AFTER the user approves or rejects.
+
+    If approved: calls POST /carts/{cart_id}/checkout and creates the order.
+    If rejected: publishes a cancellation event and returns cleanly.
+
+    This node uses conditional_edge routing in graph.py — it only runs
+    when approval_status == "approved".
+    """
+    if not state.get("user_approved", False):
+        if state.get("approval_status") == "no_action_needed":
+            return {
+                "checkout_result": {},
+                "final_message": state.get("final_message") or "No products were added to cart.",
+                "error": "",
+            }
+
+        # User rejected — do nothing, just publish event and finish cleanly
+        publish_event(
+            run_id=state["run_id"],
+            event_type="payment_cancelled",
+            data={"message": "Payment cancelled by user. Your cart has been preserved."}
+        )
+        return {
+            "checkout_result": {},
+            "final_message": "Payment was cancelled. Your cart items are still saved — you can approve later.",
+            "error": "",
+        }
+
+    # ── User approved — call checkout ─────────────────────────────────────────
+    publish_event(
+        run_id=state["run_id"],
+        event_type="checkout",
+        data={"message": "Processing your payment..."}
+    )
+
+    try:
+        idempotency_key = state.get("idempotency_key", "")
+        checkout_result = agent_tools.checkout_cart(
+            cart_id=state["cart_id"],
+            idempotency_key=idempotency_key if idempotency_key else None,
+        )
+
+        publish_event(
+            run_id=state["run_id"],
+            event_type="payment_success",
+            data={
+                "message": f"✓ Payment successful! Order #{checkout_result.get('id')} created.",
+                "order": checkout_result,
+            }
+        )
+
+        return {
+            "checkout_result": checkout_result,
+            "final_message": (
+                f"Payment successful! Your order #{checkout_result.get('id')} "
+                f"has been placed. Thank you for shopping!"
+            ),
+            "error": "",
+        }
+
+    except Exception as e:
+        error_msg = f"Checkout failed: {str(e)}"
+        logger.error(f"[process_checkout] {error_msg}")
+        publish_event(
+            run_id=state["run_id"],
+            event_type="payment_failed",
+            data={"message": f"✗ {error_msg}"}
+        )
+        return {
+            "checkout_result": {},
+            "final_message": error_msg,
+            "error": error_msg,
+        }

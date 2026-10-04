@@ -48,6 +48,11 @@ def _list_key(run_id: str) -> str:
 # Public API
 # ---------------------------------------------------------------------------
 
+import logging
+
+logger = logging.getLogger(__name__)
+
+
 def publish_event(run_id: str, event_type: str, data: dict) -> None:
     """
     Publish an agent event to Redis.
@@ -65,23 +70,26 @@ def publish_event(run_id: str, event_type: str, data: dict) -> None:
     data:
         Arbitrary JSON-serialisable payload (e.g. ``{"message": "Searching..."}``)
     """
-    redis_client = get_redis()
+    try:
+        redis_client = get_redis()
 
-    event = {
-        "run_id": run_id,
-        "type": event_type,
-        "timestamp": time.time(),
-        "data": data,
-    }
-    serialised = json.dumps(event)
+        event = {
+            "run_id": run_id,
+            "type": event_type,
+            "timestamp": time.time(),
+            "data": data,
+        }
+        serialised = json.dumps(event)
 
-    # 1. Real-time Pub/Sub fanout
-    redis_client.publish(_channel(run_id), serialised)
+        # 1. Real-time Pub/Sub fanout
+        redis_client.publish(_channel(run_id), serialised)
 
-    # 2. Persistent list — append + refresh TTL
-    list_key = _list_key(run_id)
-    redis_client.rpush(list_key, serialised)
-    redis_client.expire(list_key, EVENT_TTL)
+        # 2. Persistent list — append + refresh TTL
+        list_key = _list_key(run_id)
+        redis_client.rpush(list_key, serialised)
+        redis_client.expire(list_key, EVENT_TTL)
+    except Exception as e:
+        logger.warning(f"[events] Could not publish event {event_type} for run {run_id}: {e}")
 
 
 def get_agent_events(run_id: str) -> list[dict]:
@@ -96,9 +104,13 @@ def get_agent_events(run_id: str) -> list[dict]:
     run_id:
         The agent run identifier passed to :func:`publish_event`.
     """
-    redis_client = get_redis()
-    raw_events = redis_client.lrange(_list_key(run_id), 0, -1)
-    return [json.loads(e) for e in raw_events]
+    try:
+        redis_client = get_redis()
+        raw_events = redis_client.lrange(_list_key(run_id), 0, -1)
+        return [json.loads(e) for e in raw_events]
+    except Exception as e:
+        logger.warning(f"[events] Could not retrieve events for run {run_id}: {e}")
+        return []
 
 
 def clear_agent_events(run_id: str) -> int:
@@ -107,5 +119,9 @@ def clear_agent_events(run_id: str) -> int:
 
     Returns the number of keys deleted (0 or 1).
     """
-    redis_client = get_redis()
-    return redis_client.delete(_list_key(run_id))
+    try:
+        redis_client = get_redis()
+        return redis_client.delete(_list_key(run_id))
+    except Exception as e:
+        logger.warning(f"[events] Could not clear events for run {run_id}: {e}")
+        return 0
