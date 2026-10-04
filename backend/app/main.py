@@ -1,7 +1,10 @@
 import json
+import logging
 
 from dotenv import load_dotenv
 load_dotenv()  # Load .env into os.environ before anything else runs
+
+logger = logging.getLogger(__name__)
 
 from fastapi import FastAPI, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
@@ -66,6 +69,20 @@ def _category_products_key(category_id: int) -> str:
     return f"products:category:{category_id}"
 
 
+def _safe_cache_get(key: str) -> str | None:
+    try:
+        return get_redis().get(key)
+    except Exception:
+        return None
+
+
+def _safe_cache_setex(key: str, ttl: int, value: str) -> None:
+    try:
+        get_redis().setex(key, ttl, value)
+    except Exception:
+        pass
+
+
 # ---------------------------------------------------------------------------
 # Cache invalidation
 # ---------------------------------------------------------------------------
@@ -78,20 +95,23 @@ def _invalidate_product_caches(product_id: int | None = None) -> None:
       mutation makes them stale).
     • If product_id is given, also wipes the per-product cache.
     """
-    redis_client = get_redis()
+    try:
+        redis_client = get_redis()
 
-    # Wipe all list-style product caches via a key-pattern scan.
-    # SCAN is safe for production; KEYS is avoided intentionally.
-    cursor = 0
-    while True:
-        cursor, keys = redis_client.scan(cursor, match="products:*", count=100)
-        if keys:
-            redis_client.delete(*keys)
-        if cursor == 0:
-            break
+        # Wipe all list-style product caches via a key-pattern scan.
+        # SCAN is safe for production; KEYS is avoided intentionally.
+        cursor = 0
+        while True:
+            cursor, keys = redis_client.scan(cursor, match="products:*", count=100)
+            if keys:
+                redis_client.delete(*keys)
+            if cursor == 0:
+                break
 
-    if product_id is not None:
-        redis_client.delete(_product_key(product_id))
+        if product_id is not None:
+            redis_client.delete(_product_key(product_id))
+    except Exception as e:
+        logger.warning(f"Failed to invalidate product caches: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +228,7 @@ def create_product(
 
     # Warm the per-product cache immediately and invalidate list caches
     # so the next list request re-fetches from Postgres.
-    redis_client = get_redis()
-    redis_client.setex(
+    _safe_cache_setex(
         _product_key(new_product.id),
         PRODUCT_TTL,
         json.dumps({
@@ -232,11 +251,10 @@ def get_products(
     max_price: int | None = None,
     db: Session = Depends(get_db)
 ):
-    redis_client = get_redis()
     cache_key = _product_list_key(max_price)
 
     # --- Cache read ---
-    cached = redis_client.get(cache_key)
+    cached = _safe_cache_get(cache_key)
     if cached:
         return json.loads(cached)
 
@@ -258,7 +276,7 @@ def get_products(
         }
         for p in products
     ]
-    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+    _safe_cache_setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
 
     return products
 
@@ -285,11 +303,10 @@ def get_products_by_category_name(
             detail="Category not found"
         )
 
-    redis_client = get_redis()
     cache_key = _category_products_key(category.id)
 
     # --- Cache read ---
-    cached = redis_client.get(cache_key)
+    cached = _safe_cache_get(cache_key)
     if cached:
         return json.loads(cached)
 
@@ -307,7 +324,7 @@ def get_products_by_category_name(
         }
         for p in products
     ]
-    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+    _safe_cache_setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
 
     return products
 
@@ -320,11 +337,10 @@ def get_product(
     product_id: int,
     db: Session = Depends(get_db)
 ):
-    redis_client = get_redis()
     cache_key = _product_key(product_id)
 
     # --- Cache read ---
-    cached = redis_client.get(cache_key)
+    cached = _safe_cache_get(cache_key)
     if cached:
         return json.loads(cached)
 
@@ -339,7 +355,7 @@ def get_product(
             detail="Product not found"
         )
 
-    redis_client.setex(
+    _safe_cache_setex(
         cache_key,
         PRODUCT_TTL,
         json.dumps({
@@ -372,11 +388,10 @@ def get_products_by_category_id(
             detail="Category not found"
         )
 
-    redis_client = get_redis()
     cache_key = _category_products_key(category_id)
 
     # --- Cache read ---
-    cached = redis_client.get(cache_key)
+    cached = _safe_cache_get(cache_key)
     if cached:
         return json.loads(cached)
 
@@ -395,7 +410,7 @@ def get_products_by_category_id(
         }
         for p in products
     ]
-    redis_client.setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
+    _safe_cache_setex(cache_key, PRODUCT_TTL, json.dumps(serialised))
 
     return products
 
@@ -706,6 +721,65 @@ def get_cart(
     }
 
 
+@app.delete(
+    "/carts/{cart_id}/items",
+    status_code=200
+)
+def clear_cart_items(
+    cart_id: int,
+    db: Session = Depends(get_db)
+):
+    cart = db.query(CartModel).filter(
+        CartModel.id == cart_id
+    ).first()
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    db.query(CartItemModel).filter(
+        CartItemModel.cart_id == cart_id
+    ).delete()
+    db.commit()
+
+    return {
+        "message": "All items removed from cart",
+        "cart_id": cart_id
+    }
+
+
+@app.delete(
+    "/carts/{cart_id}",
+    status_code=200
+)
+def delete_cart(
+    cart_id: int,
+    db: Session = Depends(get_db)
+):
+    cart = db.query(CartModel).filter(
+        CartModel.id == cart_id
+    ).first()
+
+    if cart is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Cart not found"
+        )
+
+    db.query(CartItemModel).filter(
+        CartItemModel.cart_id == cart_id
+    ).delete()
+    db.delete(cart)
+    db.commit()
+
+    return {
+        "message": "Cart deleted successfully",
+        "cart_id": cart_id
+    }
+
+
 # ---------------------------------------------------------------------------
 # CHECKOUT
 # ---------------------------------------------------------------------------
@@ -857,6 +931,7 @@ def checkout_cart(
         )
     except Exception as e:
         db.rollback()
+        logger.exception(f"[checkout_cart] Unexpected error for cart_id={cart_id}: {e}")
         raise HTTPException(
             status_code=500,
             detail=f"An error occurred during checkout: {str(e)}"
